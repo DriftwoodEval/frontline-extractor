@@ -227,6 +227,13 @@ def sanitize_filename(name):
     return re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_")
 
 
+def last_name_first(name):
+    parts = name.split()
+    if len(parts) < 2:
+        return name
+    return " ".join([parts[-1], *parts[:-1]])
+
+
 def record_failed_student(student_name, student_dob, reason):
     with open(FAILED_LOG_PATH, "a") as f:
         f.write(f"{student_name} (DOB {student_dob}): {reason}\n")
@@ -378,7 +385,7 @@ def download_student_files(driver, file_url, drive_service=None, drive_folder_id
         logger.warning("No PDF appeared for %s", student_name)
         return False
 
-    filename = f"{sanitize_filename(student_name)}_{sanitize_filename(student_dob)}.pdf"
+    filename = f"{sanitize_filename(last_name_first(student_name))}_{sanitize_filename(student_dob)}.pdf"
     dest = dedupe_path(os.path.join(DOWNLOAD_DIR, filename))
     os.rename(os.path.join(DOWNLOAD_DIR, new_pdf), dest)
     logger.success("Saved %s", os.path.basename(dest))
