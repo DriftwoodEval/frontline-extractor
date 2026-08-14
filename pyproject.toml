@@ -8,7 +8,56 @@ dependencies = [
     "google-api-python-client>=2.198.0",
     "google-auth>=2.56.3",
     "google-auth-oauthlib>=1.4.0",
+    "pypdf>=6.16.0",
     "python-dotenv>=1.2.2",
     "rich>=15.0.0",
     "selenium>=4.47.0",
 ]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.10",
+]
+
+[tool.ruff.lint]
+select = [
+    "ERA",
+    "B",
+    "A",
+    "C4",
+    "FA",
+    "ICN",
+    "PIE",
+    "T20",
+    "Q",
+    "RSE",
+    "RET",
+    "SLF",
+    "SIM",
+    "ARG",
+    "PTH",
+    "FLY",
+    "I",
+    "PD",
+    "N",
+    "PERF",
+    "E",
+    "W",
+    "F",
+    "PL",
+    "UP",
+    "FURB",
+    "RUF",
+]
+
+ignore = [
+    "E501",  # line too long
+    "PLR0911",  # too many return statements ({returns} > {max_returns})
+    "PLR0912",  # too many branches ({branches} > {max_branches})
+    "PLR0913",  # too many arguments to function call ({c_args} > {max_args})
+    "PLR0915",  # too many statements ({statements} > {max_statements})
+    "PLR2004",  # magic value used in comparison, consider replacing {value} with a constant variable
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"

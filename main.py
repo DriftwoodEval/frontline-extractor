@@ -2,8 +2,11 @@ import argparse
 import logging
 import os
 import re
+import shutil
 import string
 import time
+import zipfile
+from pathlib import Path
 
 from dotenv import load_dotenv
 from google.auth.transport.requests import Request
@@ -11,6 +14,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build as build_drive_api
 from googleapiclient.http import MediaFileUpload
+from pypdf import PdfWriter
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.progress import (
@@ -22,9 +26,13 @@ from rich.progress import (
 )
 from rich.theme import Theme
 from selenium import webdriver
-from selenium.common.exceptions import NoSuchWindowException, TimeoutException
+from selenium.common.exceptions import (
+    NoSuchElementException,
+    NoSuchWindowException,
+    TimeoutException,
+)
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support import expected_conditions as EC  # noqa: N812
 from selenium.webdriver.support.select import Select
 from selenium.webdriver.support.ui import WebDriverWait
 
@@ -33,18 +41,13 @@ SEARCH_URL = "https://dorchester4.enrichcloudsc.com/Students/Search.aspx"
 DEFAULT_URL = "https://dorchester4.enrichcloudsc.com/Students/Default.aspx"
 SCHOOL = "OPEC"
 BREADCRUMB_RESET_INTERVAL = 20
-DOWNLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads")
-FAILED_LOG_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "failed_students.log"
-)
+BASE_DIR = Path(__file__).resolve().parent
+DOWNLOAD_DIR = BASE_DIR / "downloads"
+FAILED_LOG_PATH = BASE_DIR / "failed_students.log"
 
 GOOGLE_DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
-GOOGLE_CLIENT_SECRETS_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "credentials.json"
-)
-GOOGLE_TOKEN_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "token.json"
-)
+GOOGLE_CLIENT_SECRETS_FILE = BASE_DIR / "credentials.json"
+GOOGLE_TOKEN_FILE = BASE_DIR / "token.json"
 
 SUCCESS_LEVEL = 25
 logging.addLevelName(SUCCESS_LEVEL, "SUCCESS")
@@ -73,12 +76,12 @@ def wait_ready(driver, timeout=20):
 
 
 def build_driver():
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     options = webdriver.ChromeOptions()
     options.add_experimental_option(
         "prefs",
         {
-            "download.default_directory": DOWNLOAD_DIR,
+            "download.default_directory": str(DOWNLOAD_DIR),
             "download.prompt_for_download": False,
             "safebrowsing.enabled": True,
             "plugins.always_open_pdf_externally": True,
@@ -90,13 +93,13 @@ def build_driver():
 
 
 def build_drive_service():
-    if not os.path.exists(GOOGLE_CLIENT_SECRETS_FILE):
+    if not GOOGLE_CLIENT_SECRETS_FILE.exists():
         return None
 
     creds = None
-    if os.path.exists(GOOGLE_TOKEN_FILE):
+    if GOOGLE_TOKEN_FILE.exists():
         creds = Credentials.from_authorized_user_file(
-            GOOGLE_TOKEN_FILE, GOOGLE_DRIVE_SCOPES
+            str(GOOGLE_TOKEN_FILE), GOOGLE_DRIVE_SCOPES
         )
 
     if not creds or not creds.valid:
@@ -104,20 +107,20 @@ def build_drive_service():
             creds.refresh(Request())
         else:
             flow = InstalledAppFlow.from_client_secrets_file(
-                GOOGLE_CLIENT_SECRETS_FILE, GOOGLE_DRIVE_SCOPES
+                str(GOOGLE_CLIENT_SECRETS_FILE), GOOGLE_DRIVE_SCOPES
             )
             creds = flow.run_local_server(port=0)
-        with open(GOOGLE_TOKEN_FILE, "w") as f:
+        with GOOGLE_TOKEN_FILE.open("w") as f:
             f.write(creds.to_json())
 
     return build_drive_api("drive", "v3", credentials=creds)
 
 
 def upload_to_drive(service, folder_id, file_path):
-    file_metadata = {"name": os.path.basename(file_path)}
+    file_metadata = {"name": file_path.name}
     if folder_id:
         file_metadata["parents"] = [folder_id]
-    media = MediaFileUpload(file_path, mimetype="application/pdf")
+    media = MediaFileUpload(str(file_path), mimetype="application/pdf")
     service.files().create(body=file_metadata, media_body=media, fields="id").execute()
 
 
@@ -227,51 +230,244 @@ def sanitize_filename(name):
     return re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_")
 
 
+NAME_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v"}
+
+
 def last_name_first(name):
     parts = name.split()
     if len(parts) < 2:
         return name
-    return " ".join([parts[-1], *parts[:-1]])
+
+    is_suffix = parts[-1].strip(".").lower() in NAME_SUFFIXES
+    if is_suffix and len(parts) < 3:
+        # not enough parts to tell what the actual last name is
+        return name
+
+    suffix = parts.pop() if is_suffix else None
+    if len(parts) < 2:
+        return name
+
+    reordered = [parts[-1], *parts[:-1]]
+    if suffix:
+        reordered.append(suffix)
+    return " ".join(reordered)
 
 
 def record_failed_student(student_name, student_dob, reason):
-    with open(FAILED_LOG_PATH, "a") as f:
+    with FAILED_LOG_PATH.open("a") as f:
         f.write(f"{student_name} (DOB {student_dob}): {reason}\n")
 
 
 def dedupe_path(path):
-    if not os.path.exists(path):
+    if not path.exists():
         return path
-    base, ext = os.path.splitext(path)
     n = 2
-    while os.path.exists(f"{base}_{n}{ext}"):
+    candidate = path.with_stem(f"{path.stem}_{n}")
+    while candidate.exists():
         n += 1
-    return f"{base}_{n}{ext}"
+        candidate = path.with_stem(f"{path.stem}_{n}")
+    return candidate
 
 
-def latest_pdf(existing_files):
-    pdfs = [
-        f
-        for f in os.listdir(DOWNLOAD_DIR)
-        if f.lower().endswith(".pdf") and f not in existing_files
+DOWNLOAD_EXTENSIONS = (".pdf", ".zip")
+
+
+def latest_download(existing_files):
+    downloads = [
+        p
+        for p in DOWNLOAD_DIR.iterdir()
+        if p.suffix.lower() in DOWNLOAD_EXTENSIONS and p.name not in existing_files
     ]
-    if not pdfs:
+    if not downloads:
         return None
-    return max(pdfs, key=lambda f: os.path.getmtime(os.path.join(DOWNLOAD_DIR, f)))
+    return max(downloads, key=lambda p: p.stat().st_mtime).name
 
 
-def wait_for_new_pdf(existing_files, timeout=20):
+def wait_for_new_download(existing_files, timeout=20):
     deadline = time.time() + timeout
     while time.time() < deadline:
         # a .crdownload file means Chrome is still writing the download
-        if any(f.endswith(".crdownload") for f in os.listdir(DOWNLOAD_DIR)):
+        if any(p.suffix == ".crdownload" for p in DOWNLOAD_DIR.iterdir()):
             time.sleep(0.5)
             continue
-        pdf = latest_pdf(existing_files)
-        if pdf:
-            return pdf
+        download = latest_download(existing_files)
+        if download:
+            return download
         time.sleep(0.5)
     return None
+
+
+def extract_pdfs_from_zip(zip_path, extract_dir):
+    extract_dir.mkdir(exist_ok=True)
+    with zipfile.ZipFile(zip_path) as zf:
+        for name in zf.namelist():
+            if name.lower().endswith(".pdf"):
+                zf.extract(name, extract_dir)
+    return sorted(extract_dir.rglob("*.pdf"))
+
+
+def merge_pdfs(pdf_paths, dest):
+    writer = PdfWriter()
+    for path in pdf_paths:
+        writer.append(path)
+    with dest.open("wb") as f:
+        writer.write(f)
+    writer.close()
+
+
+def select_filter(dropdown, filter_value):
+    select = Select(dropdown)
+    try:
+        select.select_by_value(filter_value)
+        return
+    except NoSuchElementException:
+        pass
+    select.select_by_visible_text(filter_value)
+
+
+def generate_batch_pdf(driver, student_name, student_dob, filter_value, first=True):
+    """Runs the batch-print dialog for the given filter and returns the
+    downloaded PDF filename (relative to DOWNLOAD_DIR), or None on failure.
+
+    If `first` is False, the dialog is assumed to already be open (left on the
+    printing step from a previous call) and is navigated back to the filter
+    step instead of being re-opened, since the overlay blocks re-clicking the
+    outer "batch print" link while the dialog is still up.
+    """
+    logger.debug("[%s/%s] generate_batch_pdf starting (first=%s)", student_name, filter_value, first)
+
+    if first:
+        batch_print_link = driver.find_elements(By.ID, "ctl00_options_ctl00")
+        if not batch_print_link:
+            logger.warning("No batch print link found for %s", student_name)
+            record_failed_student(student_name, student_dob, "no batch print link")
+            return None
+        batch_print_link[0].click()
+        logger.debug("[%s/%s] clicked batch print link", student_name, filter_value)
+
+        WebDriverWait(driver, 10).until(
+            EC.frame_to_be_available_and_switch_to_it(
+                (By.CSS_SELECTOR, "iframe.vc3-dialog-frameSelector")
+            )
+        )
+    else:
+        WebDriverWait(driver, 10).until(
+            EC.frame_to_be_available_and_switch_to_it(
+                (By.CSS_SELECTOR, "iframe.vc3-dialog-frameSelector")
+            )
+        )
+        back_button = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable(
+                (By.XPATH, "//input[@type='submit' and contains(@value, 'Back')]")
+            )
+        )
+        back_button.click()
+        logger.debug("[%s/%s] clicked Back to filter step", student_name, filter_value)
+
+    filter_dropdown = WebDriverWait(driver, 10).until(
+        EC.visibility_of_element_located(
+            (By.CSS_SELECTOR, "[id$='_searchStep_documentFilterDropdown']")
+        )
+    )
+    select_filter(filter_dropdown, filter_value)
+    WebDriverWait(driver, 20).until(EC.staleness_of(filter_dropdown))
+    wait_ready(driver)
+    logger.debug("[%s/%s] filter selected", student_name, filter_value)
+
+    driver.find_element(By.CSS_SELECTOR, "input[onclick*='checkAll']").click()
+
+    WebDriverWait(driver, 10).until(
+        lambda d: any(
+            cb.is_selected()
+            for cb in d.find_elements(By.CSS_SELECTOR, "input[type='checkbox']")
+        )
+    )
+    logger.debug("[%s/%s] all items checked", student_name, filter_value)
+
+    print_buttons = driver.find_elements(
+        By.CSS_SELECTOR, "[id$='_searchStep_printButton']"
+    )
+    download_buttons = driver.find_elements(
+        By.CSS_SELECTOR, "[id$='_searchStep_batchDownload']"
+    )
+
+    original_windows = driver.window_handles
+    existing_files = {p.name for p in DOWNLOAD_DIR.iterdir()}
+
+    if print_buttons:
+        logger.debug("[%s/%s] using print flow", student_name, filter_value)
+        print_buttons[0].click()
+
+        try:
+            WebDriverWait(driver, 60).until(
+                EC.any_of(
+                    EC.presence_of_element_located(
+                        (By.CSS_SELECTOR, "[id$='_printingStep_manualPrintLink']")
+                    ),
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "span.error")),
+                )
+            )
+        except TimeoutException:
+            logger.error(
+                "Timed out waiting for the %s print link for %s", filter_value, student_name
+            )
+            input("Inspect the browser now, then press Enter to skip this student...")
+            driver.switch_to.default_content()
+            record_failed_student(
+                student_name, student_dob, f"{filter_value} print link timeout"
+            )
+            return None
+
+        error_spans = driver.find_elements(By.CSS_SELECTOR, "span.error")
+        if error_spans:
+            reason = error_spans[0].get_attribute("title") or error_spans[0].text
+            reason = " ".join(reason.split())
+            logger.warning(
+                "Generation error for %s (%s): %s", student_name, filter_value, reason
+            )
+            driver.switch_to.default_content()
+            record_failed_student(student_name, student_dob, reason)
+            return None
+
+        print_link = driver.find_element(
+            By.CSS_SELECTOR, "[id$='_printingStep_manualPrintLink']"
+        )
+        print_link.click()
+        logger.debug("[%s/%s] clicked manual print link", student_name, filter_value)
+    elif download_buttons:
+        logger.debug("[%s/%s] using download flow", student_name, filter_value)
+        download_buttons[0].click()
+    else:
+        logger.warning(
+            "No print or download button found for %s (%s)", student_name, filter_value
+        )
+        driver.switch_to.default_content()
+        record_failed_student(
+            student_name, student_dob, f"{filter_value} no print/download button"
+        )
+        return None
+
+    new_download = wait_for_new_download(existing_files)
+
+    driver.switch_to.default_content()
+    for handle in driver.window_handles:
+        if handle not in original_windows:
+            try:
+                driver.switch_to.window(handle)
+                driver.close()
+            except NoSuchWindowException:
+                pass
+
+    driver.switch_to.window(original_windows[0])
+    driver.switch_to.default_content()
+
+    if not new_download:
+        logger.warning("No file appeared for %s (%s)", student_name, filter_value)
+        record_failed_student(student_name, student_dob, f"{filter_value} no file appeared")
+        return None
+
+    logger.debug("[%s/%s] downloaded %s", student_name, filter_value, new_download)
+    return new_download
 
 
 def download_student_files(driver, file_url, drive_service=None, drive_folder_id=None):
@@ -293,6 +489,13 @@ def download_student_files(driver, file_url, drive_service=None, drive_folder_id
         )
     )
 
+    logger.debug(
+        "[%s] has_documents=%s has_attachments=%s",
+        student_name,
+        has_documents,
+        has_attachments,
+    )
+
     if not (has_documents or has_attachments):
         logger.info("No documents or attachments for %s", student_name)
         return False
@@ -302,102 +505,99 @@ def download_student_files(driver, file_url, drive_service=None, drive_folder_id
     if has_attachments:
         show_all(driver, "ctl00_content_pagingDropDownAttachment")
 
-    batch_print_link = driver.find_elements(By.ID, "ctl00_options_ctl00")
-    if not batch_print_link:
-        logger.warning("No batch print link found for %s", student_name)
+    # when a student has only attachments, the filter dropdown has no
+    # "Everything" option at all - "Attachments" is the only valid choice
+    initial_filter = "Everything" if has_documents else "Attachments"
+
+    logger.info("Fetching files for %s", student_name)
+    primary_file = generate_batch_pdf(
+        driver, student_name, student_dob, initial_filter, first=True
+    )
+    if not primary_file:
         return False
-    batch_print_link[0].click()
 
-    WebDriverWait(driver, 10).until(
-        EC.frame_to_be_available_and_switch_to_it(
-            (By.CSS_SELECTOR, "iframe.vc3-dialog-frameSelector")
-        )
-    )
+    pdf_paths = []
+    raw_pdf_downloads = []
+    zip_artifacts = []
 
-    filter_dropdown = WebDriverWait(driver, 10).until(
-        EC.visibility_of_element_located(
-            (By.ID, "ctl00_content_ctl01_searchStep_documentFilterDropdown")
-        )
-    )
-    Select(filter_dropdown).select_by_value("Everything")
-    WebDriverWait(driver, 20).until(EC.staleness_of(filter_dropdown))
-    wait_ready(driver)
-
-    driver.find_element(By.CSS_SELECTOR, "input[onclick*='checkAll']").click()
-
-    WebDriverWait(driver, 10).until(
-        lambda d: any(
-            cb.is_selected()
-            for cb in d.find_elements(By.CSS_SELECTOR, "input[type='checkbox']")
-        )
-    )
-
-    driver.find_element(By.ID, "ctl00_content_ctl01_searchStep_printButton").click()
-
-    try:
-        WebDriverWait(driver, 60).until(
-            EC.any_of(
-                EC.presence_of_element_located(
-                    (By.ID, "ctl00_content_ctl01_printingStep_manualPrintLink")
-                ),
-                EC.presence_of_element_located((By.CSS_SELECTOR, "span.error")),
+    def collect(filename):
+        path = DOWNLOAD_DIR / filename
+        if path.suffix.lower() == ".zip":
+            extract_dir = path.with_suffix("")
+            extracted = extract_pdfs_from_zip(path, extract_dir)
+            logger.debug(
+                "[%s] extracted %d PDF(s) from %s", student_name, len(extracted), path.name
             )
+            pdf_paths.extend(extracted)
+            zip_artifacts.append((path, extract_dir))
+        else:
+            pdf_paths.append(path)
+            raw_pdf_downloads.append(path)
+
+    collect(primary_file)
+
+    # only worth a second "Attachments" pass when both documents and
+    # attachments exist - if there are only attachments, the "Everything"
+    # pass above already covers them
+    if has_documents and has_attachments:
+        logger.info("Fetching attachments for %s", student_name)
+        attachments_file = generate_batch_pdf(
+            driver, student_name, student_dob, "Attachments", first=False
         )
-    except TimeoutException:
-        logger.error("Timed out waiting for the print link for %s", student_name)
-        input("Inspect the browser now, then press Enter to skip this student...")
-        driver.switch_to.default_content()
-        record_failed_student(student_name, student_dob, "print link timeout")
-        return False
+        if attachments_file:
+            collect(attachments_file)
 
-    error_spans = driver.find_elements(By.CSS_SELECTOR, "span.error")
-    if error_spans:
-        reason = error_spans[0].get_attribute("title") or error_spans[0].text
-        reason = " ".join(reason.split())
-        logger.warning("Generation error for %s: %s", student_name, reason)
-        driver.switch_to.default_content()
-        record_failed_student(student_name, student_dob, reason)
-        return False
-
-    print_link = driver.find_element(
-        By.ID, "ctl00_content_ctl01_printingStep_manualPrintLink"
-    )
-
-    original_windows = driver.window_handles
-    existing_files = set(os.listdir(DOWNLOAD_DIR))
-    print_link.click()
-
-    new_pdf = wait_for_new_pdf(existing_files)
-
-    driver.switch_to.default_content()
-    for handle in driver.window_handles:
-        if handle not in original_windows:
-            try:
-                driver.switch_to.window(handle)
-                driver.close()
-            except NoSuchWindowException:
-                pass
-
-    driver.switch_to.window(original_windows[0])
-    driver.switch_to.default_content()
-
-    if not new_pdf:
-        logger.warning("No PDF appeared for %s", student_name)
+    if not pdf_paths:
+        logger.warning("No PDF content found for %s", student_name)
+        record_failed_student(student_name, student_dob, "no PDF content in download(s)")
+        for zip_path, extract_dir in zip_artifacts:
+            zip_path.unlink(missing_ok=True)
+            if extract_dir.exists():
+                shutil.rmtree(extract_dir)
         return False
 
     filename = f"{sanitize_filename(last_name_first(student_name))}_{sanitize_filename(student_dob)}.pdf"
-    dest = dedupe_path(os.path.join(DOWNLOAD_DIR, filename))
-    os.rename(os.path.join(DOWNLOAD_DIR, new_pdf), dest)
-    logger.success("Saved %s", os.path.basename(dest))
+    dest = dedupe_path(DOWNLOAD_DIR / filename)
+
+    if len(pdf_paths) > 1:
+        logger.debug("[%s] merging %d PDF(s) into %s", student_name, len(pdf_paths), dest.name)
+        merge_pdfs(pdf_paths, dest)
+        for path in raw_pdf_downloads:
+            path.unlink()
+    else:
+        pdf_paths[0].rename(dest)
+
+    for zip_path, extract_dir in zip_artifacts:
+        zip_path.unlink(missing_ok=True)
+        if extract_dir.exists():
+            shutil.rmtree(extract_dir)
+
+    logger.success("Saved %s", dest.name)
 
     if drive_service is not None:
         try:
             upload_to_drive(drive_service, drive_folder_id, dest)
-            logger.success("Uploaded %s to Google Drive", os.path.basename(dest))
+            logger.success("Uploaded %s to Google Drive", dest.name)
         except Exception:
-            logger.exception("Failed to upload %s to Google Drive", os.path.basename(dest))
+            logger.exception("Failed to upload %s to Google Drive", dest.name)
 
     return True
+
+
+def expand_letters(spec):
+    letters = []
+    for raw_token in spec.split(","):
+        token = raw_token.strip()
+        if not token:
+            continue
+        if len(token) == 3 and token[1] == "-":
+            start, end = token[0].lower(), token[2].lower()
+            if start > end:
+                start, end = end, start
+            letters.extend(chr(c) for c in range(ord(start), ord(end) + 1))
+        else:
+            letters.extend(token.lower())
+    return "".join(letters)
 
 
 def parse_args():
@@ -411,7 +611,8 @@ def parse_args():
     parser.add_argument(
         "--letters",
         default=string.ascii_lowercase,
-        help="Letters to search last names by (default: a-z)",
+        type=expand_letters,
+        help="Letters to search last names by, e.g. 'c-z' or 'a,d-f,z' (default: a-z)",
     )
     parser.add_argument(
         "--max-downloads-per-letter",
@@ -419,17 +620,34 @@ def parse_args():
         default=None,
         help="Stop downloading after this many successes per letter (default: no limit)",
     )
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Enable debug-level logging (step-by-step batch print/download trace)",
+    )
     return parser.parse_args()
 
 
 def main():
+    args = parse_args()
+
     console = Console(theme=RICH_THEME)
     handler = RichHandler(console=console, show_path=False, markup=True)
     logging.basicConfig(
-        level=logging.INFO, format="%(message)s", datefmt="[%X]", handlers=[handler]
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(message)s",
+        datefmt="[%X]",
+        handlers=[handler],
     )
 
-    args = parse_args()
+    logger.info(
+        "Options: letters=%s max_downloads=%s max_downloads_per_letter=%s verbose=%s",
+        args.letters,
+        args.max_downloads,
+        args.max_downloads_per_letter,
+        args.verbose,
+    )
 
     load_dotenv()
     username = os.environ["FRONTLINE_USERNAME"]
