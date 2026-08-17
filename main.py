@@ -315,6 +315,55 @@ def merge_pdfs(pdf_paths, dest):
     writer.close()
 
 
+def compile_downloads(student_name, student_dob, filenames):
+    """Turns a set of downloaded files (PDFs and/or zips) into the single,
+    renamed PDF used everywhere else. Returns the destination path, or None
+    if none of the files contained any PDF content.
+    """
+    pdf_paths = []
+    raw_pdf_downloads = []
+    zip_artifacts = []
+
+    for filename in filenames:
+        path = DOWNLOAD_DIR / filename
+        if path.suffix.lower() == ".zip":
+            extract_dir = path.with_suffix("")
+            extracted = extract_pdfs_from_zip(path, extract_dir)
+            logger.debug(
+                "[%s] extracted %d PDF(s) from %s", student_name, len(extracted), path.name
+            )
+            pdf_paths.extend(extracted)
+            zip_artifacts.append((path, extract_dir))
+        else:
+            pdf_paths.append(path)
+            raw_pdf_downloads.append(path)
+
+    if not pdf_paths:
+        for zip_path, extract_dir in zip_artifacts:
+            zip_path.unlink(missing_ok=True)
+            if extract_dir.exists():
+                shutil.rmtree(extract_dir)
+        return None
+
+    filename = f"{sanitize_filename(last_name_first(student_name))}_{sanitize_filename(student_dob)}.pdf"
+    dest = dedupe_path(DOWNLOAD_DIR / filename)
+
+    if len(pdf_paths) > 1:
+        logger.debug("[%s] merging %d PDF(s) into %s", student_name, len(pdf_paths), dest.name)
+        merge_pdfs(pdf_paths, dest)
+        for path in raw_pdf_downloads:
+            path.unlink()
+    else:
+        pdf_paths[0].rename(dest)
+
+    for zip_path, extract_dir in zip_artifacts:
+        zip_path.unlink(missing_ok=True)
+        if extract_dir.exists():
+            shutil.rmtree(extract_dir)
+
+    return dest
+
+
 def select_filter(dropdown, filter_value):
     select = Select(dropdown)
     try:
@@ -516,25 +565,7 @@ def download_student_files(driver, file_url, drive_service=None, drive_folder_id
     if not primary_file:
         return False
 
-    pdf_paths = []
-    raw_pdf_downloads = []
-    zip_artifacts = []
-
-    def collect(filename):
-        path = DOWNLOAD_DIR / filename
-        if path.suffix.lower() == ".zip":
-            extract_dir = path.with_suffix("")
-            extracted = extract_pdfs_from_zip(path, extract_dir)
-            logger.debug(
-                "[%s] extracted %d PDF(s) from %s", student_name, len(extracted), path.name
-            )
-            pdf_paths.extend(extracted)
-            zip_artifacts.append((path, extract_dir))
-        else:
-            pdf_paths.append(path)
-            raw_pdf_downloads.append(path)
-
-    collect(primary_file)
+    filenames = [primary_file]
 
     # only worth a second "Attachments" pass when both documents and
     # attachments exist - if there are only attachments, the "Everything"
@@ -545,32 +576,13 @@ def download_student_files(driver, file_url, drive_service=None, drive_folder_id
             driver, student_name, student_dob, "Attachments", first=False
         )
         if attachments_file:
-            collect(attachments_file)
+            filenames.append(attachments_file)
 
-    if not pdf_paths:
+    dest = compile_downloads(student_name, student_dob, filenames)
+    if dest is None:
         logger.warning("No PDF content found for %s", student_name)
         record_failed_student(student_name, student_dob, "no PDF content in download(s)")
-        for zip_path, extract_dir in zip_artifacts:
-            zip_path.unlink(missing_ok=True)
-            if extract_dir.exists():
-                shutil.rmtree(extract_dir)
         return False
-
-    filename = f"{sanitize_filename(last_name_first(student_name))}_{sanitize_filename(student_dob)}.pdf"
-    dest = dedupe_path(DOWNLOAD_DIR / filename)
-
-    if len(pdf_paths) > 1:
-        logger.debug("[%s] merging %d PDF(s) into %s", student_name, len(pdf_paths), dest.name)
-        merge_pdfs(pdf_paths, dest)
-        for path in raw_pdf_downloads:
-            path.unlink()
-    else:
-        pdf_paths[0].rename(dest)
-
-    for zip_path, extract_dir in zip_artifacts:
-        zip_path.unlink(missing_ok=True)
-        if extract_dir.exists():
-            shutil.rmtree(extract_dir)
 
     logger.success("Saved %s", dest.name)
 
@@ -582,6 +594,191 @@ def download_student_files(driver, file_url, drive_service=None, drive_folder_id
             logger.exception("Failed to upload %s to Google Drive", dest.name)
 
     return True
+
+
+FAILED_LOG_LINE_RE = re.compile(r"^(.*) \(DOB (.*)\): (.*)$")
+
+
+def parse_failed_log():
+    """Parses failed_students.log into a list of unique {name, dob} entries,
+    in first-seen order, deduping repeat lines for the same student.
+    """
+    if not FAILED_LOG_PATH.exists():
+        return []
+
+    entries = {}
+    order = []
+    for raw_line in FAILED_LOG_PATH.read_text().splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = FAILED_LOG_LINE_RE.match(line)
+        if not match:
+            logger.warning("Skipping unparseable failed-log line: %s", line)
+            continue
+        name, dob, _reason = match.groups()
+        key = (name, dob)
+        if key not in entries:
+            entries[key] = {"name": name, "dob": dob}
+            order.append(key)
+
+    return [entries[key] for key in order]
+
+
+def remove_failed_log_entries(resolved_keys):
+    if not resolved_keys or not FAILED_LOG_PATH.exists():
+        return
+
+    kept_lines = []
+    for raw_line in FAILED_LOG_PATH.read_text().splitlines():
+        match = FAILED_LOG_LINE_RE.match(raw_line.strip())
+        if match and (match.group(1), match.group(2)) in resolved_keys:
+            continue
+        kept_lines.append(raw_line)
+
+    content = "\n".join(kept_lines)
+    FAILED_LOG_PATH.write_text(f"{content}\n" if content else "")
+
+
+def split_name(full_name):
+    """Best-effort first/last name split for search, e.g. 'Austin Steven
+    Baker' -> ('Austin', 'Baker'). Trailing suffixes like 'Jr' are ignored
+    when picking the last name.
+    """
+    parts = full_name.split()
+    if len(parts) > 2 and parts[-1].strip(".").lower() in NAME_SUFFIXES:
+        parts = parts[:-1]
+    if len(parts) < 2:
+        return full_name, ""
+    return parts[0], parts[-1]
+
+
+def search_student(driver, first_name, last_name):
+    logger.info("Searching for '%s %s'", first_name, last_name)
+    driver.get(SEARCH_URL)
+    last_name_field = WebDriverWait(driver, 10).until(
+        EC.presence_of_element_located((By.ID, "ctl00_content_studentSearch_lastName"))
+    )
+    last_name_field.send_keys(last_name)
+    first_name_field = driver.find_element(By.ID, "ctl00_content_studentSearch_firstName")
+    first_name_field.send_keys(first_name)
+    search_button = driver.find_element(By.ID, "ctl00_content_studentSearch_Button1")
+    click_and_wait_for_postback(driver, search_button)
+
+
+def find_student_link(driver, first_name, last_name, target_dob):
+    search_student(driver, first_name, last_name)
+    links = collect_all_file_links(driver)
+    if not links:
+        return None
+    if len(links) == 1:
+        return links[0]
+
+    # multiple results with the same name - disambiguate by DOB
+    target_dob = target_dob.strip()
+    for link in links:
+        driver.get(link)
+        wait_ready(driver)
+        try:
+            dob = get_student_dob(driver)
+        except NoSuchElementException:
+            continue
+        if dob.strip() == target_dob:
+            return link
+
+    return None
+
+
+def wait_for_manual_downloads_to_settle(timeout=300):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not any(p.suffix == ".crdownload" for p in DOWNLOAD_DIR.iterdir()):
+            return
+        time.sleep(0.5)
+
+
+def process_failed_entry(driver, entry, drive_service, drive_folder_id):
+    student_name = entry["name"]
+    student_dob = entry["dob"]
+    first_name, last_name = split_name(student_name)
+
+    logger.info("Looking up %s (DOB %s)", student_name, student_dob)
+    link = find_student_link(driver, first_name, last_name, student_dob)
+    if not link:
+        logger.warning("Could not find a matching page for %s (DOB %s)", student_name, student_dob)
+        record_failed_student(student_name, student_dob, "not found via manual-retry search")
+        return False
+
+    driver.get(link)
+    wait_ready(driver)
+
+    while True:
+        existing_files = {p.name for p in DOWNLOAD_DIR.iterdir()}
+        response = (
+            input(
+                f"Download all files for {student_name} (DOB {student_dob}) in the "
+                "browser now, then press Enter (or type 's' to skip this student)... "
+            )
+            .strip()
+            .lower()
+        )
+        if response == "s":
+            logger.warning("Skipped %s (DOB %s)", student_name, student_dob)
+            record_failed_student(student_name, student_dob, "skipped during manual retry")
+            return False
+
+        wait_for_manual_downloads_to_settle()
+        new_files = sorted(
+            p.name
+            for p in DOWNLOAD_DIR.iterdir()
+            if p.suffix.lower() in DOWNLOAD_EXTENSIONS and p.name not in existing_files
+        )
+        if not new_files:
+            retry = input(
+                "No new files detected. Press Enter to try again, or type 's' to skip... "
+            ).strip().lower()
+            if retry == "s":
+                record_failed_student(student_name, student_dob, "no files downloaded during manual retry")
+                return False
+            continue
+
+        dest = compile_downloads(student_name, student_dob, new_files)
+        if dest is None:
+            retry = input(
+                "None of the downloaded files contained a PDF. Press Enter to try "
+                "again, or type 's' to skip... "
+            ).strip().lower()
+            if retry == "s":
+                record_failed_student(student_name, student_dob, "downloaded files contained no PDFs")
+                return False
+            continue
+
+        logger.success("Saved %s", dest.name)
+        if drive_service is not None:
+            try:
+                upload_to_drive(drive_service, drive_folder_id, dest)
+                logger.success("Uploaded %s to Google Drive", dest.name)
+            except Exception:
+                logger.exception("Failed to upload %s to Google Drive", dest.name)
+        return True
+
+
+def run_retry_failed(driver, drive_service, drive_folder_id):
+    entries = parse_failed_log()
+    if not entries:
+        logger.info("No failed students found in %s", FAILED_LOG_PATH)
+        return
+
+    logger.info("Retrying %d failed student(s) from %s", len(entries), FAILED_LOG_PATH)
+    resolved = set()
+    for entry in entries:
+        if process_failed_entry(driver, entry, drive_service, drive_folder_id):
+            resolved.add((entry["name"], entry["dob"]))
+
+    if resolved:
+        remove_failed_log_entries(resolved)
+        logger.info("Resolved %d student(s); removed from %s", len(resolved), FAILED_LOG_PATH)
+    logger.info("%d student(s) still unresolved", len(entries) - len(resolved))
 
 
 def expand_letters(spec):
@@ -626,6 +823,15 @@ def parse_args():
         action="store_true",
         help="Enable debug-level logging (step-by-step batch print/download trace)",
     )
+    parser.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help=(
+            "Instead of the normal scan, go through failed_students.log: look up each "
+            "student, open their page, wait for you to download the files by hand, then "
+            "compile/rename them as usual and remove resolved entries from the log"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -641,13 +847,16 @@ def main():
         handlers=[handler],
     )
 
-    logger.info(
-        "Options: letters=%s max_downloads=%s max_downloads_per_letter=%s verbose=%s",
-        args.letters,
-        args.max_downloads,
-        args.max_downloads_per_letter,
-        args.verbose,
-    )
+    if args.retry_failed:
+        logger.info("Options: retry_failed=True verbose=%s", args.verbose)
+    else:
+        logger.info(
+            "Options: letters=%s max_downloads=%s max_downloads_per_letter=%s verbose=%s",
+            args.letters,
+            args.max_downloads,
+            args.max_downloads_per_letter,
+            args.verbose,
+        )
 
     load_dotenv()
     username = os.environ["FRONTLINE_USERNAME"]
@@ -660,6 +869,12 @@ def main():
 
     driver = build_driver()
     login(driver, username, password)
+
+    if args.retry_failed:
+        run_retry_failed(driver, drive_service, drive_folder_id)
+        input("Press Enter to close...")
+        driver.quit()
+        return
 
     processed = set()
     downloads = 0
