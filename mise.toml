@@ -1,0 +1,22 @@
+[tools]
+python = "3.13"
+uv = "latest"
+
+[settings.task]
+output = "interleave"
+
+[tasks.install]
+description = "Install dependencies"
+run = "uv sync"
+
+[tasks.check]
+description = "Lint and format Python"
+run = """
+uv run ruff check . --fix
+uv run ruff format .
+"""
+
+[tasks.run]
+description = "Run the frontline extractor"
+raw_args = true
+run = "uv run main.py"
